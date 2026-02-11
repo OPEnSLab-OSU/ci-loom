@@ -104,10 +104,10 @@ def run_clang_format_diff(args, file):
             original = f.readlines()
     except IOError as exc:
         raise DiffError(str(exc))
-    invocation = [args.clang_format_executable, file]
+    invocation = [args.clang_format_executable, '-style=file']
     if args.fix:
         invocation.append('-i')
-    invocation.extend(['-style=file', file])
+    invocation.append(file)
 
     # Use of utf-8 to decode the process output.
     #
@@ -155,7 +155,16 @@ def run_clang_format_diff(args, file):
     if proc.returncode:
         raise DiffError("clang-format exited with status {}: '{}'".format(
             proc.returncode, file), errs)
-    return make_diff(file, original, outs), errs
+    
+    # In -i mode stdout is empty resulting in there always being diffs
+    if args.fix:
+      with io.open(file, 'r', encoding='utf-8') as f:
+        reformatted = f.readlines()
+    else:
+      reformatted = outs
+
+
+    return make_diff(file, original, reformatted), errs
 
 
 def bold_red(s):
