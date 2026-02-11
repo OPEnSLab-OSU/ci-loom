@@ -1,0 +1,10 @@
+.vscode
+.DS_Store
+.clang-format
+.clangd
+.justfile
+
+# Credentials/secrets
+**/arduino_secrets.h
+**/wifi_creds.json
+**/mqtt_creds.json
