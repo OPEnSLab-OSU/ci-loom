@@ -1,0 +1,53 @@
+name: Clang-Format Testing (No Fails)
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  clang_format:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout ci-loom scripts
+        uses: actions/checkout@v4
+        with:
+          repository: OPEnSLab-OSU/ci-loom
+          ref: main
+          path: ci-loom
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format python3
+
+      - name: "clang-format (act: scans whole repo)"
+        if: ${{ env.ACT == 'true' }}
+        run: |
+          python3 ci-loom/run-clang-format.py -r . -e "ci-loom/*" -e "bin/*" || true
+
+      - name: "clang-format (PR: scans changes only)"
+        if: ${{ env.ACT != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.sha }}"
+
+          # Get changed files (Added/Copied/Modified/Renamed)
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx|h\+\+|C|H)$' || true)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No C/C++ files changed in this PR."
+            exit 0
+          fi
+
+          # Run formatter check on just these files. Print diff, and succeed even if differences found.
+          python3 ci-loom/run-clang-format.py "${files[@]}" || true
