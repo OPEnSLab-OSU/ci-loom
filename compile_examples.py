@@ -3,8 +3,10 @@
 # Uses the arduino-cli compiler to compile all sketches 
 # --examples-dir can be passed as an arg to change the default example path (/examples). 
 import argparse
+import atexit
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -30,6 +32,53 @@ USING_LEGACY_RECORD_PATTERN = re.compile(
 USING_PLATFORM_AT_PATTERN = re.compile(
     r"^Using (?P<kind>platform|core) (?P<name>[^@\s]+)@(?P<version>\S+)\b"
 )
+
+ACTIVE_PROCESS: subprocess.Popen[str] | None = None
+
+
+def terminate_active_process():
+    global ACTIVE_PROCESS
+
+    process = ACTIVE_PROCESS
+    if process is None or process.poll() is not None:
+        ACTIVE_PROCESS = None
+        return
+
+    print(f"\n{YELLOW}Terminating active arduino-cli process (PID {process.pid})...{NC}")
+
+    if sys.platform.startswith("win"):
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        ACTIVE_PROCESS = None
+        return
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        print(f"{YELLOW}arduino-cli did not exit promptly; killing process {process.pid}.{NC}")
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        ACTIVE_PROCESS = None
+
+
+def handle_termination_signal(_signum, _frame):
+    terminate_active_process()
+    raise KeyboardInterrupt
+
+
+atexit.register(terminate_active_process)
+
+try:
+    signal.signal(signal.SIGINT, handle_termination_signal)
+    signal.signal(signal.SIGTERM, handle_termination_signal)
+except (AttributeError, ValueError):
+    pass
 
 
 def bundled_arduino_cli_candidates() -> list[Path]:
@@ -100,11 +149,34 @@ def check_arduino_cli(arduino_cli_path: Path | None = None) -> str:
     return cli
 
 
+def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    global ACTIVE_PROCESS
+
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ACTIVE_PROCESS = process
+
+    try:
+        stdout, stderr = process.communicate()
+    except KeyboardInterrupt:
+        terminate_active_process()
+        raise
+    finally:
+        if ACTIVE_PROCESS is process:
+            ACTIVE_PROCESS = None
+
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
+
 def run_cli_inventory_command(cli: str, args: list[str], title: str):
     print(f"\n{title}")
     print("-" * len(title))
 
-    result = subprocess.run([cli, *args], capture_output=True, text=True)
+    result = run_command([cli, *args])
     output = (result.stdout + result.stderr).strip()
 
     if output:
@@ -134,7 +206,7 @@ def get_installed_platform_record(cli: str, fqbn: str) -> tuple[str, str, str] |
         return None
 
     platform_id = f"{fqbn_parts[0]}:{fqbn_parts[1]}"
-    result = subprocess.run([cli, "core", "list"], capture_output=True, text=True)
+    result = run_command([cli, "core", "list"])
 
     if result.returncode != 0:
         print(f"{YELLOW}WARNING: unable to read installed core list for dependency report.{NC}")
@@ -253,11 +325,7 @@ def collect_dependency_snapshot(
 ) -> tuple[subprocess.CompletedProcess[str], list[tuple[str, str, str]]]:
     print(f"\nCollecting dependency snapshot from {sketch.name}...")
 
-    result = subprocess.run(
-        [cli, "compile", "--fqbn", fqbn, "--verbose", str(sketch.parent)],
-        capture_output=True,
-        text=True,
-    )
+    result = run_command([cli, "compile", "--fqbn", fqbn, "--verbose", str(sketch.parent)])
 
     combined_output = f"{result.stdout}\n{result.stderr}"
     records: list[tuple[str, str, str]] = []
@@ -331,11 +399,7 @@ def compile_examples(
         if sketch == dependency_snapshot_sketch and dependency_snapshot_result is not None:
             result = dependency_snapshot_result
         else:
-            result = subprocess.run(
-                [cli, "compile", "--fqbn", fqbn, str(sketch.parent)],
-                capture_output=True,
-                text=True,
-            )
+            result = run_command([cli, "compile", "--fqbn", fqbn, str(sketch.parent)])
 
         if result.returncode == 0:
             print(f"{GREEN} PASSED: {sketch.name}{NC}")
@@ -364,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--examples-dir", type=Path, default=Path(__file__).parent / "examples")
     parser.add_argument("--fqbn", default=DEFAULT_FQBN)
     parser.add_argument("--arduino-cli", type=Path, default=None)
-    parser.add_argument("--show-dependencies", action="store_true")
+    parser.add_argument("--show-dependencies", action="store_true", dest="show_dependencies")
     parser.add_argument("--dependency-report", nargs="?", const=Path(DEFAULT_DEPENDENCY_REPORT), type=Path, default=None)
     parser.add_argument("--no-dependency-report", action="store_true")
     args = parser.parse_args()
@@ -387,10 +451,15 @@ if __name__ == "__main__":
     if args.no_dependency_report:
         dependency_report = None
 
-    compile_examples(
-        cli,
-        examples_dir,
-        args.fqbn,
-        show_dependencies=args.show_dependencies,
-        dependency_report=dependency_report,
-    )
+    try:
+        compile_examples(
+            cli,
+            examples_dir,
+            args.fqbn,
+            show_dependencies=args.show_dependencies,
+            dependency_report=dependency_report,
+        )
+    except KeyboardInterrupt:
+        terminate_active_process()
+        print(f"\n{YELLOW}Interrupted. Active arduino-cli process was terminated.{NC}")
+        sys.exit(130)
