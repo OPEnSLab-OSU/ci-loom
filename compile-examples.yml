@@ -1,0 +1,133 @@
+name: Compile Examples
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - ".github/workflows/compile-examples.yml"
+      - "auxilary/package_loom4_index.json"
+      - "compile_examples.py"
+      - "examples/**"
+      - "library.properties"
+      - "src/**"
+  push:
+    branches: [main, dev]
+    paths:
+      - ".github/workflows/compile-examples.yml"
+      - "auxilary/package_loom4_index.json"
+      - "compile_examples.py"
+      - "examples/**"
+      - "library.properties"
+      - "src/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FQBN: loom4:samd:adafruit_feather_m0
+  LOOM_PLATFORM_VERSION: "4.9"
+  ARDUINO_ADDITIONAL_URLS: https://adafruit.github.io/arduino-board-index/package_adafruit_index.json,https://raw.githubusercontent.com/OPEnSLab-OSU/Loom-V4/main/auxilary/package_loom4_index.json
+  ARDUINO_DATA_DIR: ${{ github.workspace }}/.arduino/data
+  ARDUINO_SKETCHBOOK_DIR: ${{ github.workspace }}/.arduino/sketchbook
+
+jobs:
+  compile_examples:
+    name: Compile examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Configure Arduino workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$ARDUINO_DATA_DIR" "$ARDUINO_SKETCHBOOK_DIR/libraries"
+
+          arduino-cli config init --overwrite
+          arduino-cli config set directories.data "$ARDUINO_DATA_DIR"
+          arduino-cli config set directories.user "$ARDUINO_SKETCHBOOK_DIR"
+
+          ln -sfn "$GITHUB_WORKSPACE" "$ARDUINO_SKETCHBOOK_DIR/libraries/Loom"
+
+      - name: Install Loom board package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          arduino-cli core update-index --additional-urls "$ARDUINO_ADDITIONAL_URLS"
+          # Should updated package_loom4_index.json with tool dependancies so we can skip this additional install. 
+          arduino-cli core install arduino:samd
+          arduino-cli core install "loom4:samd@$LOOM_PLATFORM_VERSION" --additional-urls "$ARDUINO_ADDITIONAL_URLS"
+
+      - name: Select checked-out Loom source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundled_loom="$ARDUINO_DATA_DIR/packages/loom4/hardware/samd/$LOOM_PLATFORM_VERSION/libraries/Loom"
+          if [ -e "$bundled_loom" ]; then
+            echo "Removing bundled Loom library from installed board package: $bundled_loom"
+            rm -rf "$bundled_loom"
+          fi
+
+          ln -sfn "$GITHUB_WORKSPACE" "$ARDUINO_SKETCHBOOK_DIR/libraries/Loom"
+
+          resolved_loom="$(readlink -f "$ARDUINO_SKETCHBOOK_DIR/libraries/Loom")"
+          resolved_workspace="$(readlink -f "$GITHUB_WORKSPACE")"
+          if [ "$resolved_loom" != "$resolved_workspace" ]; then
+            echo "Expected Loom library to resolve to $resolved_workspace, got $resolved_loom" >&2
+            exit 1
+          fi
+
+      - name: Generate compile-only secret headers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t secret_sketches < <(grep -rl '#include "arduino_secrets.h"' examples --include='*.ino' || true)
+
+          for sketch in "${secret_sketches[@]}"; do
+            secrets_dir="$(dirname "$sketch")"
+            {
+              printf '%s\n' '#pragma once'
+              printf '%s\n' ''
+              printf '%s\n' '#define SECRET_SSID "ci-ssid"'
+              printf '%s\n' '#define SECRET_PASS "ci-pass"'
+              printf '%s\n' ''
+              printf '%s\n' '#define NETWORK_NAME "ci-network"'
+              printf '%s\n' '#define NETWORK_APN "ci-apn"'
+              printf '%s\n' '#define NETWORK_USER "ci-user"'
+              printf '%s\n' '#define NETWORK_PASS "ci-pass"'
+              printf '%s\n' ''
+              printf '%s\n' '#define SECRET_BROKER "ci-broker"'
+              printf '%s\n' '#define SECRET_PORT 1883'
+              printf '%s\n' '#define DATABASE "ci-database"'
+              printf '%s\n' '#define PROJECT "ci-project"'
+              printf '%s\n' '#define BROKER_USER "ci-user"'
+              printf '%s\n' '#define BROKER_PASS "ci-pass"'
+              printf '%s\n' ''
+              printf '%s\n' '#define CHANNEL_ID 0'
+              printf '%s\n' '#define CLIENT_ID "ci-client"'
+            } > "$secrets_dir/arduino_secrets.h"
+          done
+
+          echo "Generated ${#secret_sketches[@]} compile-only arduino_secrets.h file(s)."
+
+      - name: Compile examples and report dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 compile_examples.py \
+            --fqbn "$FQBN" \
+            --show-dependencies \
+            --no-dependency-report \
+            --fail-fast
