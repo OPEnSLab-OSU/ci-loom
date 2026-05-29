@@ -55,13 +55,26 @@ def terminate_active_process():
         ACTIVE_PROCESS = None
         return
 
-    process.terminate()
+    try:
+        process_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        ACTIVE_PROCESS = None
+        return
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        ACTIVE_PROCESS = None
+        return
 
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         print(f"{YELLOW}arduino-cli did not exit promptly; killing process {process.pid}.{NC}")
-        process.kill()
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait(timeout=5)
     finally:
         ACTIVE_PROCESS = None
@@ -152,11 +165,20 @@ def check_arduino_cli(arduino_cli_path: Path | None = None) -> str:
 def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     global ACTIVE_PROCESS
 
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+
+    if sys.platform.startswith("win"):
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
     process = subprocess.Popen(
         args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        **popen_kwargs,
     )
     ACTIVE_PROCESS = process
 
@@ -281,8 +303,7 @@ def format_dependency_report(records: list[tuple[str, str, str]], fqbn: str) -> 
     lines = [
         "# Compile Dependencies",
         "",
-        "Stable aggregate of dependency names and versions selected by arduino-cli while compiling examples.",
-        "Paths, timestamps, and per-sketch details are intentionally omitted so this file only changes when the dependency set changes.",
+        "Formatted aggregate of dependency names and versions selected by arduino-cli while compiling examples.",
         "",
         f"- FQBN: `{fqbn}`",
         "",
@@ -353,6 +374,7 @@ def compile_examples(
     fqbn: str,
     show_dependencies: bool = False,
     dependency_report: Path | None = None,
+    fail_fast: bool = False,
 ):
     all_inos = list(examples_dir.rglob("*.ino"))
 
@@ -410,9 +432,9 @@ def compile_examples(
             print(result.stderr)
             print(f"{RED} FAILED: {sketch.name}{NC}")
             failed += 1
-
-    if dependency_report:
-        write_dependency_report(dependency_report, report_records, fqbn)
+            if fail_fast:
+                print(f"{RED}Stopping after first failed sketch because --fail-fast is enabled.{NC}")
+                sys.exit(1)
 
     print(f"\n{'=' * 38}")
     print("Compilation Results:")
@@ -431,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--show-dependencies", action="store_true", dest="show_dependencies")
     parser.add_argument("--dependency-report", nargs="?", const=Path(DEFAULT_DEPENDENCY_REPORT), type=Path, default=None)
     parser.add_argument("--no-dependency-report", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
     examples_dir = args.examples_dir.resolve()
@@ -458,6 +481,7 @@ if __name__ == "__main__":
             args.fqbn,
             show_dependencies=args.show_dependencies,
             dependency_report=dependency_report,
+            fail_fast=args.fail_fast,
         )
     except KeyboardInterrupt:
         terminate_active_process()
